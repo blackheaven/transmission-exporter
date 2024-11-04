@@ -1,0 +1,5 @@
+tested-with: GHC==9.6.6
+
+packages: *.cabal
+
+package transmission-exporter
