@@ -333,8 +333,8 @@ instance FromJSON SessionStats where
         <*> arguments .: "pausedTorrentCount"
         <*> arguments .: "torrentCount"
         <*> arguments .: "uploadSpeed"
-        <*> arguments .: "cumulative-stats"
         <*> arguments .: "current-stats"
+        <*> arguments .: "cumulative-stats"
 
 data SessionStatsSub = SessionStatsSub
   { secondsActive :: Double,
