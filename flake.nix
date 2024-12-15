@@ -19,6 +19,11 @@
           {
             overrides = hself: hsuper: { };
           };
+
+        nixpkgsOverlay = _final: _prev: {
+          transmission-exporter = self.packages.${system}.transmission-exporter;
+        };
+
       in
       rec {
         packages.transmission-exporter =
@@ -47,9 +52,74 @@
           };
         };
 
-        defaultPackage = packages.transmission-exporter;
+        packages.default = packages.transmission-exporter;
 
-        devShell =
+        overlays = nixpkgsOverlay;
+
+        nixosModules.default =
+          { pkgs, lib, config, ... }:
+          let
+            cfg = config.services.transmission-exporter;
+          in
+          {
+            options = with lib; {
+                services.transmission-exporter = {
+                  enable = mkEnableOption "Efficient Transmission-bt Prometheus exporter";
+                  package = lib.mkPackageOption pkgs "transmission-exporter" {};
+                  transmissionAddr = lib.mkOption {
+                    type = types.str;
+                    default = "http://localhost:9091";
+                  };
+                  transmissionUser = lib.mkOption {
+                    type = types.str;
+                  };
+                  transmissionPasswordFile = lib.mkOption {
+                    type = types.path;
+                  };
+                  openFirewall = lib.mkOption {
+                    type = types.bool;
+                    default = false;
+                  };
+                  webListenAddr = lib.mkOption {
+                    type = types.str;
+                    default = "0.0.0.0";
+                  };
+                  webListenPort = lib.mkOption {
+                    type = types.port;
+                    default = 19091;
+                  };
+                  webEndpointPath = lib.mkOption {
+                    type = types.str;
+                    default = "/metrics";
+                  };
+              };
+            };
+            config = lib.mkIf cfg.enable {
+              nixpkgs.overlays = [ nixpkgsOverlay ];
+
+              networking.firewall.allowedTCPPorts = lib.optional cfg.openFirewall cfg.webListenPort;
+
+              systemd.services.transmission-exporter = {
+                description = "Efficient Transmission-bt Prometheus exporter";
+                after = [ "network.target" ];
+                wantedBy = [ "multi-user.target" ];
+                script = ''
+                  export TRANSMISSION_PASSWORD=$(cat ${cfg.transmissionPasswordFile})
+                  exec ${lib.getExe cfg.package}
+                '';
+                serviceConfig = {
+                  Environment = [
+                    "WEB_PATH=${cfg.webEndpointPath}"
+                    "WEB_ADDR=${cfg.webListenAddr}:${builtins.toString cfg.webListenPort}"
+                    "TRANSMISSION_ADDR=${cfg.transmissionAddr}"
+                    "TRANSMISSION_USERNAME=${cfg.transmissionUser}"
+                  ];
+                };
+              };
+            };
+          };
+
+        devShells.default =
           pkgs.mkShell {
             buildInputs = with haskellPackages; [
               haskell-language-server
@@ -57,7 +127,7 @@
               cabal-install
               ormolu
             ];
-            inputsFrom = [ self.defaultPackage.${system}.env ];
+            inputsFrom = [ self.packages.${system}.default.env ];
           };
       });
 }
