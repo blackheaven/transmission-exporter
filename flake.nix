@@ -104,16 +104,22 @@
                 after = [ "network.target" ];
                 wantedBy = [ "multi-user.target" ];
                 script = ''
-                  export TRANSMISSION_PASSWORD=$(cat ${cfg.transmissionPasswordFile})
+                  ${
+                    lib.strings.optionalString
+                      (cfg.transmissionPasswordFile != null)
+                      "export TRANSMISSION_PASSWORD=$(cat ${cfg.transmissionPasswordFile})"
+                  }
                   exec ${lib.getExe cfg.package}
                 '';
                 serviceConfig = {
                   Environment = [
                     "WEB_PATH=${cfg.webEndpointPath}"
-                    "WEB_ADDR=${cfg.webListenAddr}:${builtins.toString cfg.webListenPort}"
+                    "WEB_ADDR=${cfg.webListenAddr}"
+                    "WEB_PORT=${builtins.toString cfg.webListenPort}"
                     "TRANSMISSION_ADDR=${cfg.transmissionAddr}"
+                  ] ++ (lib.lists.optional (cfg.transmissionUser != null)
                     "TRANSMISSION_USERNAME=${cfg.transmissionUser}"
-                  ];
+                  );
                 };
               };
             };

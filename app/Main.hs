@@ -2,27 +2,22 @@
 
 module Main (main) where
 
-import Control.Lens
+import Control.Applicative
 import Control.Monad
-import Data.Aeson
-import Data.Aeson.QQ.Simple
-import qualified Data.Aeson.Types as Aeson
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Builder as Build
 import qualified Data.ByteString.Lazy.Char8 as BL
-import Data.String (fromString)
+import Data.IORef
+import Data.Prometheus.Exporter.Transmission
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import qualified Env
-import GHC.Generics
 import Network.HTTP.Types (status200, status404)
 import Network.Wai (rawPathInfo, responseLBS)
 import Network.Wai.Handler.Warp (HostPreference, defaultSettings, runSettings, setHost, setPort)
-import qualified Network.Wreq as Wreq
 import Prometheus
 import System.IO
-import Text.Read (readMaybe)
 import Prelude
 
 main :: IO ()
@@ -30,98 +25,24 @@ main = do
   hSetBuffering stdout LineBuffering
   settings <- Env.parse (Env.header "Transmission Prometheus Exporter") settingsP
 
-  let warpSettings = setHost (fst settings.listenOn) $ setPort (snd settings.listenOn) defaultSettings
-  putStrLn $ "Starting server on " <> show (fst settings.listenOn) <> ":" <> show (snd settings.listenOn) <> " with endpoint " <> show settings.endpoint
+  let warpSettings = setHost settings.listenAddress $ setPort settings.listenPort defaultSettings
+  putStrLn $ "Starting server on " <> show settings.listenAddress <> ":" <> show settings.listenPort <> " with endpoint " <> show settings.listenEndpoint
+
+  refMSessionId <- newIORef Nothing
   runSettings warpSettings $ \req respond -> do
     let path = rawPathInfo req
-    if path == settings.endpoint
-      then getMetrics settings >>= respond . responseLBS status200 [("Content-Type", "text/plain")]
+    if path == settings.listenEndpoint
+      then buildMetrics refMSessionId settings >>= respond . responseLBS status200 [("Content-Type", "text/plain")]
       else respond $ responseLBS status404 [("Content-Type", "text/plain")] "Not Found"
 
-getMetrics :: Settings -> IO BL.ByteString
-getMetrics settings = do
-  let authHeader = Wreq.auth ?~ Wreq.basicAuth settings.transmissionUsername settings.transmissionPassword
-      rpcEndpoint = settings.transmissionAddr <> "/transmission/rpc"
-      neverThrow = Wreq.checkResponse ?~ (\_ _ -> return ())
+buildMetrics :: IORef (Maybe SessionId) -> Settings -> IO BL.ByteString
+buildMetrics refMSessionId settings = do
+  mSessionId <- readIORef refMSessionId
+  (torrents, session, sessionStats, sessionId) <-
+    getMetrics (mkEndpointFromAddress settings.transmissionAddr) settings.transmissionAuth mSessionId
+  writeIORef refMSessionId $ Just sessionId
 
-  initResponse <-
-    Wreq.postWith (Wreq.defaults & authHeader & neverThrow) rpcEndpoint [aesonQQ|{}|]
-
-  let sessionIdHeader =
-        Wreq.header "X-Transmission-Session-Id"
-          .~ [initResponse ^. Wreq.responseHeader "X-Transmission-Session-Id"]
-
-  torrentsResponse <-
-    Wreq.postWith
-      (Wreq.defaults & authHeader & sessionIdHeader)
-      rpcEndpoint
-      [aesonQQ|
-        {
-           "arguments": {
-             "fields": [
-              "id",
-              "name",
-              "hashString",
-              "status",
-              "addedDate",
-              "leftUntilDone",
-              "eta",
-              "uploadRatio",
-              "rateDownload",
-              "rateUpload",
-              "downloadDir",
-              "downloadedEver",
-              "isFinished",
-              "percentDone",
-              "seedRatioMode",
-              "error",
-              "errorString",
-              "files",
-              "fileStats",
-              "peers",
-              "trackers",
-              "trackerStats",
-              "peersConnected",
-              "peersGettingFromUs",
-              "peersSendingToUs",
-              "totalSize",
-              "uploadedEver"
-             ]
-           },
-           "method": "torrent-get",
-           "tag": 42
-        }
-      |]
-      >>= Wreq.asJSON
-
-  sessionResponse <-
-    Wreq.postWith
-      (Wreq.defaults & authHeader & sessionIdHeader)
-      rpcEndpoint
-      [aesonQQ|
-        {
-           "method": "session-get",
-           "tag": 43
-        }
-      |]
-      >>= Wreq.asJSON
-
-  sessionStatsResponse <-
-    Wreq.postWith
-      (Wreq.defaults & authHeader & sessionIdHeader)
-      rpcEndpoint
-      [aesonQQ|
-        {
-           "method": "session-stats",
-           "tag": 44
-        }
-      |]
-      >>= Wreq.asJSON
-
-  let Torrents torrents = torrentsResponse ^. Wreq.responseBody
-      session = sessionResponse ^. Wreq.responseBody
-      sessionStats = sessionStatsResponse ^. Wreq.responseBody
-      singletonSG :: Text -> Text -> LabelPairs -> B.ByteString -> SampleGroup
+  let singletonSG :: Text -> Text -> LabelPairs -> B.ByteString -> SampleGroup
       singletonSG name desc labels value = SampleGroup (Info name desc) GaugeType [Sample name labels value]
       sessionSG :: Text -> Text -> (Session -> B.ByteString) -> SampleGroup
       sessionSG name desc f = singletonSG name desc [] $ f session
@@ -190,170 +111,29 @@ getMetrics settings = do
         ]
 
 data Settings = Settings
-  { endpoint :: B.ByteString,
-    listenOn :: (HostPreference, Int),
+  { listenEndpoint :: B.ByteString,
+    listenAddress :: HostPreference,
+    listenPort :: Int,
     transmissionAddr :: String,
-    transmissionUsername :: B.ByteString,
-    transmissionPassword :: B.ByteString
+    transmissionAuth :: Auth
   }
-  deriving stock (Show)
 
 settingsP :: (Env.AsUnset e, Env.AsUnread e) => Env.Parser e Settings
 settingsP =
   Settings
-    <$> Env.var Env.str "WEB_PATH" (Env.def "/metrics" <> Env.helpDef (T.unpack . T.decodeUtf8) <> Env.help "Path for metrics")
-    <*> Env.var listenR "WEB_ADDR" (Env.def ("0.0.0.0", 19091) <> Env.helpDef (\(h, p) -> show h <> ":" <> show p) <> Env.help "Address for this exporter to run")
+    <$> Env.var Env.str "WEB_PATH" (Env.def "/metrics" <> Env.helpDef show <> Env.help "Path for metrics")
+    <*> Env.var Env.str "WEB_ADDR" (Env.def "0.0.0.0" <> Env.helpDef show <> Env.help "Address for this exporter to listen")
+    <*> Env.var Env.auto "WEB_PORT" (Env.def 19091 <> Env.helpDef show <> Env.help "Port for this exporter to listen")
     <*> Env.var Env.str "TRANSMISSION_ADDR" (Env.def "http://localhost:9091" <> Env.helpDef Prelude.id <> Env.help "Transmission address to connect with")
-    <*> Env.var Env.str "TRANSMISSION_USERNAME" (Env.help "Transmission username")
-    <*> Env.var Env.str "TRANSMISSION_PASSWORD" (Env.help "Transmission password")
+    <*> authP
   where
-    listenR :: (Env.AsUnread e) => Env.Reader e (HostPreference, Int)
-    listenR x =
-      case (takeWhile (/= ':') x, drop 1 $ dropWhile (/= ':') x) of
-        (rawHost, rawPort) ->
-          case readMaybe rawPort of
-            Nothing -> Left $ Env.unread $ "Unable to read port in " <> show x
-            Just port -> Right (fromString $ if null rawHost then "*" else rawHost, port)
-
-newtype Torrents = Torrents {unTorrents :: [Torrent]}
-  deriving stock (Eq, Ord, Show)
-
-instance FromJSON Torrents where
-  parseJSON =
-    withObject "TorrentsResponse" $ \response -> do
-      ensureResponse response 42
-      arguments <- response .: "arguments"
-      Torrents <$> arguments .: "torrents"
-
-ensureResponse :: Object -> Int -> Aeson.Parser ()
-ensureResponse response expectedTag = do
-  result :: Text <- response .: "result"
-  unless (result == "success") $
-    error $
-      "result: "
-        <> show result
-
-  tag :: Int <- response .: "tag"
-  unless (tag == expectedTag) $
-    error $
-      "tag: "
-        <> show tag
-
-data Torrent = Torrent
-  { id :: Int,
-    name :: Text,
-    addedDate :: Double,
-    percentDone :: Double,
-    rateDownload :: Double,
-    downloadedEver :: Double,
-    rateUpload :: Double,
-    uploadedEver :: Double,
-    peersConnected :: Int,
-    peersGettingFromUs :: Double,
-    peersSendingToUs :: Double,
-    uploadRatio :: Double,
-    status :: Int,
-    isFinished :: Bool
-  }
-  deriving stock (Eq, Ord, Show, Generic)
-  deriving anyclass (FromJSON)
-
-data Session = Session
-  { altSpeedDownBytes :: Int,
-    altSpeedDownEnabled :: Bool,
-    altSpeedUpBytes :: Int,
-    altSpeedUpEnabled :: Bool,
-    cacheSizeBytes :: Double,
-    freeSpace :: Double,
-    downloadDir :: Text,
-    incompleteDir :: Text,
-    globalPeerLimit :: Int,
-    queueDownBytes :: Int,
-    queueDownEnabled :: Bool,
-    queueUpBytes :: Int,
-    queueUpEnabled :: Bool,
-    seedRatioLimit :: Double,
-    seedRatioLimitEnabled :: Bool,
-    speedLimitDownBytes :: Double,
-    speedLimitDownEnabled :: Bool,
-    speedLimitUpBytes :: Double,
-    speedLimitUpEnabled :: Bool,
-    version :: Text
-  }
-  deriving stock (Eq, Ord, Show)
-
-instance FromJSON Session where
-  parseJSON =
-    withObject "SessionResponse" $ \response -> do
-      ensureResponse response 43
-      arguments <- response .: "arguments"
-      Session
-        <$> arguments .: "alt-speed-down"
-        <*> arguments .: "alt-speed-enabled"
-        <*> arguments .: "alt-speed-up"
-        <*> arguments .: "alt-speed-enabled"
-        <*> arguments .: "cache-size-mb"
-        <*> arguments .: "download-dir-free-space"
-        <*> arguments .: "download-dir"
-        <*> arguments .: "incomplete-dir"
-        <*> arguments .: "peer-limit-global"
-        <*> arguments .: "download-queue-size"
-        <*> arguments .: "download-queue-enabled"
-        <*> arguments .: "seed-queue-size"
-        <*> arguments .: "seed-queue-enabled"
-        <*> arguments .: "seedRatioLimit"
-        <*> arguments .: "seedRatioLimited"
-        <*> arguments .: "speed-limit-down"
-        <*> arguments .: "speed-limit-down-enabled"
-        <*> arguments .: "speed-limit-up"
-        <*> arguments .: "speed-limit-up-enabled"
-        <*> arguments .: "version"
-
-data SessionStats = SessionStats
-  { active :: Double,
-    downloadSpeedBytes :: Double,
-    torrentsActive :: Int,
-    torrentsPaused :: Int,
-    torrentsTotal :: Int,
-    uploadSpeedBytes :: Double,
-    subCurrent :: SessionStatsSub,
-    subCumulative :: SessionStatsSub
-  }
-  deriving stock (Eq, Ord, Show)
-
-instance FromJSON SessionStats where
-  parseJSON =
-    withObject "SessionStatsResponse" $ \response -> do
-      ensureResponse response 44
-      arguments <- response .: "arguments"
-      SessionStats
-        <$> arguments .: "activeTorrentCount"
-        <*> arguments .: "downloadSpeed"
-        <*> arguments .: "activeTorrentCount"
-        <*> arguments .: "pausedTorrentCount"
-        <*> arguments .: "torrentCount"
-        <*> arguments .: "uploadSpeed"
-        <*> arguments .: "current-stats"
-        <*> arguments .: "cumulative-stats"
-
-data SessionStatsSub = SessionStatsSub
-  { secondsActive :: Double,
-    downloadedBytes :: Double,
-    filesAdded :: Int,
-    sessions :: Int,
-    uploadedBytes :: Double
-  }
-  deriving stock (Eq, Ord, Show)
-
-instance FromJSON SessionStatsSub where
-  parseJSON =
-    withObject "SessionStatsSub" $ \s ->
-      SessionStatsSub
-        <$> s .: "secondsActive"
-        <*> s .: "downloadedBytes"
-        <*> s .: "filesAdded"
-        <*> s .: "sessionCount"
-        <*> s .: "uploadedBytes"
+    authP :: (Env.AsUnset e) => Env.Parser e Auth
+    authP =
+      ( BasicAuth
+          <$> Env.var Env.str "TRANSMISSION_USERNAME" (Env.help "Transmission username")
+          <*> Env.var Env.str "TRANSMISSION_PASSWORD" (Env.help "Transmission password")
+      )
+        <|> Env.flag NoAuth NoAuth "TRANSMISSION_NO_AUTH" (Env.help "Transmission does not require a password")
 
 exportSampleGroup :: SampleGroup -> Build.Builder
 exportSampleGroup (SampleGroup info ty samples) =
