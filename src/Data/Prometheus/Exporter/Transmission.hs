@@ -16,6 +16,7 @@ module Data.Prometheus.Exporter.Transmission
   )
 where
 
+import Control.Exception (catch, throw)
 import Control.Lens
 import Control.Monad
 import Data.Aeson
@@ -279,7 +280,9 @@ rpc (Endpoint rpcEndpoint) auth mSessionId payload = do
             (toJSON payload)
         return (retryResponse, newSessionId)
 
-  parsedResponse <- Wreq.asJSON lastResponse
+  parsedResponse <-
+    Wreq.asJSON lastResponse
+      `catch` \ex@(Wreq.JSONError _) -> print lastResponse >> print (lastResponse ^. Wreq.responseBody) >> throw ex
   return (parsedResponse, sessionId)
 
 newtype Endpoint = Endpoint String
