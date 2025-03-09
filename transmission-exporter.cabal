@@ -1,6 +1,6 @@
 cabal-version:       3.0
 name:                transmission-exporter
-version:             0.1.0.0
+version:             0.1.1.0
 author:              Gautier DI FOLCO
 maintainer:          gautier.difolco@gmail.com
 category:            Data
@@ -40,7 +40,9 @@ library
   build-depends:
       base
     , aeson
+    , aeson-qq
     , bytestring
+    , containers
     , lens
     , text
     , wreq

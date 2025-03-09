@@ -1,12 +1,24 @@
 {-# LANGUAGE QuasiQuotes #-}
 
 module Data.Prometheus.Exporter.Transmission
-  ( -- * Entrypooints
+  ( -- * Entrypoints
+
+    -- * Metrics
     getMetrics,
     Torrent (..),
+    TorrentTransientId (..),
     Session (..),
     SessionStats (..),
     SessionStatsSub (..),
+
+    -- * Queries
+    torrentFiles,
+    TorrentFile (..),
+
+    -- * Actions
+    torrentsRemove,
+    RemoveTorrentAction (..),
+    torrentsMoveIn,
 
     -- * Plumbing
     Endpoint (..),
@@ -20,15 +32,18 @@ import Control.Exception (catch, throw)
 import Control.Lens
 import Control.Monad
 import Data.Aeson
-import Data.Aeson.QQ.Simple
+import Data.Aeson.QQ
 import qualified Data.Aeson.Types as Aeson
 import qualified Data.ByteString as B
+import qualified Data.Map.Strict as Map
 import Data.Maybe (fromJust)
 import Data.Text (Text)
 import GHC.Generics
 import qualified Network.Wreq as Wreq
 import System.IO
 import Prelude
+
+-- * Metrics
 
 getMetrics :: Endpoint -> Auth -> Maybe SessionId -> IO ([Torrent], Session, SessionStats, SessionId)
 getMetrics rpcEndpoint auth mSessionId = do
@@ -58,8 +73,6 @@ getMetrics rpcEndpoint auth mSessionId = do
               "seedRatioMode",
               "error",
               "errorString",
-              "files",
-              "fileStats",
               "peers",
               "trackers",
               "trackerStats",
@@ -67,7 +80,8 @@ getMetrics rpcEndpoint auth mSessionId = do
               "peersGettingFromUs",
               "peersSendingToUs",
               "totalSize",
-              "uploadedEver"
+              "uploadedEver",
+              "labels"
              ]
            },
            "method": "torrent-get",
@@ -99,21 +113,21 @@ getMetrics rpcEndpoint auth mSessionId = do
         }
       |]
 
-  let Torrents torrents = torrentsResponse ^. Wreq.responseBody
+  let TorrentsResponse torrents = torrentsResponse ^. Wreq.responseBody
       session = sessionResponse ^. Wreq.responseBody
       sessionStats = sessionStatsResponse ^. Wreq.responseBody
 
   return (torrents, session, sessionStats, sessionId2)
 
-newtype Torrents = Torrents {unTorrents :: [Torrent]}
+newtype TorrentsResponse a = TorrentsResponse {unTorrents :: [a]}
   deriving stock (Eq, Ord, Show)
 
-instance FromJSON Torrents where
+instance (FromJSON a) => FromJSON (TorrentsResponse a) where
   parseJSON =
     withObject "TorrentsResponse" $ \response -> do
       ensureResponse response 42
       arguments <- response .: "arguments"
-      Torrents <$> arguments .: "torrents"
+      TorrentsResponse <$> arguments .: "torrents"
 
 ensureResponse :: Object -> Int -> Aeson.Parser ()
 ensureResponse response expectedTag = do
@@ -129,9 +143,14 @@ ensureResponse response expectedTag = do
       "tag: "
         <> show tag
 
+newtype TorrentTransientId = TorrentTransientId {unTorrentTransientId :: Int}
+  deriving stock (Eq, Ord, Show, Generic)
+  deriving newtype (FromJSON, ToJSON)
+
 data Torrent = Torrent
-  { id :: Int,
+  { id :: TorrentTransientId,
     name :: Text,
+    labels :: [Text],
     addedDate :: Double,
     percentDone :: Double,
     rateDownload :: Double,
@@ -245,7 +264,118 @@ instance FromJSON SessionStatsSub where
         <*> s .: "sessionCount"
         <*> s .: "uploadedBytes"
 
--- | RPC
+-- * Queries
+
+torrentFiles ::
+  Endpoint ->
+  Auth ->
+  Maybe SessionId ->
+  [TorrentTransientId] ->
+  IO (Map.Map TorrentTransientId [TorrentFile], SessionId)
+torrentFiles rpcEndpoint auth mSessionId ids = do
+  (torrentsResponse, sessionId0) <-
+    rpc @_ @(TorrentsResponse TorrentForFiles)
+      rpcEndpoint
+      auth
+      mSessionId
+      [aesonQQ|
+        {
+           "arguments": {
+             "fields": [ "id", "name", "files" ],
+             "ids": #{ids}
+           },
+           "method": "torrent-get",
+           "tag": 42
+        }
+      |]
+
+  let TorrentsResponse torrents = torrentsResponse ^. Wreq.responseBody
+      files = Map.fromList $ flip map torrents $ \tf -> (tf.id, tf.files)
+
+  return (files, sessionId0)
+
+data TorrentForFiles = TorrentForFiles
+  { id :: TorrentTransientId,
+    files :: [TorrentFile]
+  }
+  deriving stock (Eq, Ord, Show, Generic)
+  deriving anyclass (FromJSON)
+
+data TorrentFile = TorrentFile
+  { name :: Text,
+    sizeBytes :: Integer
+  }
+  deriving stock (Eq, Ord, Show)
+
+instance FromJSON TorrentFile where
+  parseJSON =
+    withObject "TorrentFile" $ \f ->
+      TorrentFile
+        <$> f .: "name"
+        <*> f .: "length"
+
+-- * Action
+
+data RemoveTorrentAction
+  = RemoveTorrentOnly
+  | RemoveTorrentAndLocalData
+  deriving stock (Eq, Ord, Show)
+
+torrentsRemove ::
+  Endpoint ->
+  Auth ->
+  Maybe SessionId ->
+  [TorrentTransientId] ->
+  RemoveTorrentAction ->
+  IO SessionId
+torrentsRemove rpcEndpoint auth mSessionId ids action = do
+  (_, sessionId0) <-
+    rpc @_ @Discarded
+      rpcEndpoint
+      auth
+      mSessionId
+      [aesonQQ|
+        {
+           "arguments": {
+             "ids": #{ids},
+             "delete-local-data": #{action == RemoveTorrentAndLocalData}
+           },
+           "method": "torrent-remove",
+           "tag": 42
+        }
+      |]
+
+  return sessionId0
+
+torrentsMoveIn ::
+  Endpoint ->
+  Auth ->
+  Maybe SessionId ->
+  [TorrentTransientId] ->
+  FilePath ->
+  IO SessionId
+torrentsMoveIn rpcEndpoint auth mSessionId ids location = do
+  (_, sessionId0) <-
+    rpc @_ @Discarded
+      rpcEndpoint
+      auth
+      mSessionId
+      [aesonQQ|
+        {
+           "arguments": {
+             "ids": #{ids},
+             "location": #{location},
+             "move": true
+           },
+           "method": "torrent-set-location",
+           "tag": 42
+        }
+      |]
+
+  return sessionId0
+
+-- * RPC
+
 rpc ::
   (ToJSON payload, FromJSON responseBody) =>
   Endpoint ->
@@ -293,3 +423,8 @@ mkEndpointFromAddress address = Endpoint $ address <> "/transmission/rpc"
 data Auth = NoAuth | BasicAuth B.ByteString B.ByteString
 
 newtype SessionId = SessionId B.ByteString
+
+data Discarded = Discarded
+
+instance FromJSON Discarded where
+  parseJSON _ = return Discarded
