@@ -25,19 +25,23 @@ module Data.Prometheus.Exporter.Transmission
     mkEndpointFromAddress,
     Auth (..),
     SessionId (..),
+    envParser,
   )
 where
 
+import Control.Applicative
 import Control.Exception (catch, throw)
 import Control.Lens
 import Control.Monad
 import Data.Aeson
 import Data.Aeson.QQ
 import qualified Data.Aeson.Types as Aeson
+import Data.Bifunctor (first)
 import qualified Data.ByteString as B
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromJust)
 import Data.Text (Text)
+import qualified Env
 import GHC.Generics
 import qualified Network.Wreq as Wreq
 import System.IO
@@ -424,6 +428,22 @@ data Auth = NoAuth | BasicAuth B.ByteString B.ByteString
 
 newtype SessionId = SessionId B.ByteString
 
+envParser :: (Env.AsUnset e) => Env.Parser e (Endpoint, Auth)
+envParser =
+  fmap (first mkEndpointFromAddress) $
+    (,)
+      <$> Env.var Env.str "TRANSMISSION_ADDR" (Env.def "http://localhost:9091" <> Env.helpDef Prelude.id <> Env.help "Transmission address to connect with")
+      <*> authP
+  where
+    authP :: (Env.AsUnset e) => Env.Parser e Auth
+    authP =
+      ( BasicAuth
+          <$> Env.var Env.str "TRANSMISSION_USERNAME" (Env.help "Transmission username")
+          <*> Env.var Env.str "TRANSMISSION_PASSWORD" (Env.help "Transmission password")
+      )
+        <|> Env.flag NoAuth NoAuth "TRANSMISSION_NO_AUTH" (Env.help "Transmission does not require a password")
+
+-- | Body helpes
 data Discarded = Discarded
 
 instance FromJSON Discarded where

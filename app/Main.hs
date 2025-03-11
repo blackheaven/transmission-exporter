@@ -39,7 +39,7 @@ buildMetrics :: IORef (Maybe SessionId) -> Settings -> IO BL.ByteString
 buildMetrics refMSessionId settings = do
   mSessionId <- readIORef refMSessionId
   (torrents, session, sessionStats, sessionId) <-
-    getMetrics (mkEndpointFromAddress settings.transmissionAddr) settings.transmissionAuth mSessionId
+    uncurry getMetrics settings.transmission mSessionId
   writeIORef refMSessionId $ Just sessionId
 
   let singletonSG :: Text -> Text -> LabelPairs -> B.ByteString -> SampleGroup
@@ -114,8 +114,7 @@ data Settings = Settings
   { listenEndpoint :: B.ByteString,
     listenAddress :: HostPreference,
     listenPort :: Int,
-    transmissionAddr :: String,
-    transmissionAuth :: Auth
+    transmission :: (Endpoint, Auth)
   }
 
 settingsP :: (Env.AsUnset e, Env.AsUnread e) => Env.Parser e Settings
@@ -124,16 +123,7 @@ settingsP =
     <$> Env.var Env.str "WEB_PATH" (Env.def "/metrics" <> Env.helpDef show <> Env.help "Path for metrics")
     <*> Env.var Env.str "WEB_ADDR" (Env.def "0.0.0.0" <> Env.helpDef show <> Env.help "Address for this exporter to listen")
     <*> Env.var Env.auto "WEB_PORT" (Env.def 19091 <> Env.helpDef show <> Env.help "Port for this exporter to listen")
-    <*> Env.var Env.str "TRANSMISSION_ADDR" (Env.def "http://localhost:9091" <> Env.helpDef Prelude.id <> Env.help "Transmission address to connect with")
-    <*> authP
-  where
-    authP :: (Env.AsUnset e) => Env.Parser e Auth
-    authP =
-      ( BasicAuth
-          <$> Env.var Env.str "TRANSMISSION_USERNAME" (Env.help "Transmission username")
-          <*> Env.var Env.str "TRANSMISSION_PASSWORD" (Env.help "Transmission password")
-      )
-        <|> Env.flag NoAuth NoAuth "TRANSMISSION_NO_AUTH" (Env.help "Transmission does not require a password")
+    <*> envParser
 
 exportSampleGroup :: SampleGroup -> Build.Builder
 exportSampleGroup (SampleGroup info ty samples) =

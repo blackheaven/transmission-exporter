@@ -43,6 +43,7 @@ library
     , aeson-qq
     , bytestring
     , containers
+    , envparse
     , lens
     , text
     , wreq
