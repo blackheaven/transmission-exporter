@@ -18,7 +18,10 @@ module Data.Prometheus.Exporter.Transmission
     -- * Actions
     torrentsRemove,
     RemoveTorrentAction (..),
+    torrentsChangeLocation,
     torrentsMoveIn,
+    torrentsSetLabels,
+    torrentsVerify,
 
     -- * Plumbing
     Endpoint (..),
@@ -372,6 +375,83 @@ torrentsMoveIn rpcEndpoint auth mSessionId ids location = do
              "move": true
            },
            "method": "torrent-set-location",
+           "tag": 42
+        }
+      |]
+
+  return sessionId0
+
+torrentsChangeLocation ::
+  Endpoint ->
+  Auth ->
+  Maybe SessionId ->
+  [TorrentTransientId] ->
+  FilePath ->
+  IO SessionId
+torrentsChangeLocation rpcEndpoint auth mSessionId ids location = do
+  (_, sessionId0) <-
+    rpc @_ @Discarded
+      rpcEndpoint
+      auth
+      mSessionId
+      [aesonQQ|
+        {
+           "arguments": {
+             "ids": #{ids},
+             "location": #{location},
+             "move": false
+           },
+           "method": "torrent-set-location",
+           "tag": 42
+        }
+      |]
+
+  return sessionId0
+
+torrentsSetLabels ::
+  Endpoint ->
+  Auth ->
+  Maybe SessionId ->
+  [TorrentTransientId] ->
+  [Text] ->
+  IO SessionId
+torrentsSetLabels rpcEndpoint auth mSessionId ids labels = do
+  (_, sessionId0) <-
+    rpc @_ @Discarded
+      rpcEndpoint
+      auth
+      mSessionId
+      [aesonQQ|
+        {
+           "arguments": {
+             "ids": #{ids},
+             "labels": #{labels}
+           },
+           "method": "torrent-set",
+           "tag": 42
+        }
+      |]
+
+  return sessionId0
+
+torrentsVerify ::
+  Endpoint ->
+  Auth ->
+  Maybe SessionId ->
+  [TorrentTransientId] ->
+  IO SessionId
+torrentsVerify rpcEndpoint auth mSessionId ids = do
+  (_, sessionId0) <-
+    rpc @_ @Discarded
+      rpcEndpoint
+      auth
+      mSessionId
+      [aesonQQ|
+        {
+           "arguments": {
+             "ids": #{ids}
+           },
+           "method": "torrent-verify",
            "tag": 42
         }
       |]
